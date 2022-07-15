@@ -1,78 +1,83 @@
 #![feature(test)]
 extern crate test;
 
-use std::sync::{Arc, Mutex};
-use std::sync::{RwLock, RwLockWriteGuard, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard, RwLockReadGuard};
 use std::ops::{Deref, DerefMut};
 
 /// Vector Map Builder
 ///
-/// To use VecMap, specify the size of the required Vector
-/// and allocate memory after specifying all of them.
-///
-/// VecMapBuilder provides the above steps.
-pub struct VecMapBuilder {
-    partitions: Arc<Mutex<Vec<isize>>>,
+pub struct VecMapBuilder<T> {
+    data: Mutex<Vec<T>>,
+    partitions: Mutex<Vec<usize>>,
 }
 
-impl VecMapBuilder {
-
-    /// Create new storage builder.
+impl<T: Clone> VecMapBuilder<T> {
+    
+    /// Create new builder.
     pub fn new() -> Self {
-	VecMapBuilder { partitions: Arc::new(Mutex::new(vec![0])) }
+	let data = Mutex::new(Vec::new());
+	let partitions = Mutex::new(vec![0]);
+	Self { data, partitions }
     }
 
-    /// Allocate memory buffer with size.
-    /// This phase does not really allocate memory.
-    /// Allocation is thread-safe, but does not improve performance
-    /// because of the global mutex.
-    ///
-    pub fn alloc(&self, size: isize) -> usize {
-	let mut partitions = self.partitions.lock().unwrap();
+    /// Insert vector.
+    /// Returns index of inserted vector.
+    pub fn insert(&self, xs: &[T]) -> usize {
+	let mut partitions = self.partitions.lock();
 	let len = partitions.len();
 	let offset = partitions[len - 1];
-	partitions.push(offset + size);
+	partitions.push(offset + xs.len());
+	self.data.lock().extend_from_slice(xs);
 	len - 1
     }
 
-    /// Build mutable vecmap, and really allocate all memory.
+    /// Build mutable vecmap.
     /// # Examples
     ///
     /// ```
     /// use vecmap::VecMapBuilder;
     /// 
     /// let builder = VecMapBuilder::new();
-    /// builder.alloc(10);
-    /// builder.alloc(5);
-    /// let vecmap = builder.build_mut(0); // 0 is a initial value.
+    /// builder.insert(&[1, 2, 3]);
+    /// builder.insert(&[4, 5]);
+    /// let vecmap = builder.build_mut();
+    /// vecmap.borrow_mut(0)[0] = 2;
+    /// assert_eq!([2, 2, 3], *vecmap.borrow_mut(0));
     /// ```
-    pub fn build_mut<T: Clone>(&self, initial_value: T) -> MutVecMap<T> {
-	let partitions = self.partitions.lock().unwrap().iter()
+    pub fn build_mut<'a>(&'a self) -> MutVecMap<'a, T> {
+	let partitions = self.partitions.lock().iter()
 	    .map(|x| RwLock::new(*x))
 	    .collect::<Vec<_>>();
-	let len = *partitions.last().unwrap().read().unwrap();
-	let store = vec![initial_value; len as usize];
-	MutVecMap {store, partitions}
+	let data = unsafe {
+	    let data = self.data.lock();
+	    let ptr = data.as_ptr() as *const T;
+	    std::slice::from_raw_parts(ptr, data.len())
+	};
+	MutVecMap {data, partitions}
     }
 
-    /// Build immutable vecmap, and really allocate all memory.
+    /// Build immutable vecmap
     /// # Examples
     ///
     /// ```
     /// use vecmap::VecMapBuilder;
     /// 
     /// let builder = VecMapBuilder::new();
-    /// builder.alloc(10);
-    /// builder.alloc(5);
-    /// let vecmap = builder.build(0); // 0 is a initial value.
+    /// builder.insert(&[1, 2, 3]);
+    /// builder.insert(&[4, 5]);
+    /// let vecmap = builder.build();
+    /// assert_eq!([1, 2, 3], *vecmap.borrow(0));
     /// ```
-    pub fn build<T: Clone>(&self, initial_value: T) -> VecMap<T> {
-	let partitions = self.partitions.lock().unwrap().iter()
+    pub fn build<'a>(&'a self) -> VecMap<'a, T> {
+	let partitions = self.partitions.lock().iter()
 	    .map(|x| *x)
 	    .collect::<Vec<_>>();
-	let len = *partitions.last().unwrap();
-	let store = vec![initial_value; len as usize];
-	VecMap {store, partitions}
+	let data = unsafe {
+	    let data = self.data.lock();
+	    let ptr = data.as_ptr() as *const T;
+	    std::slice::from_raw_parts(ptr, data.len())
+	};
+	VecMap {data, partitions}
     }
 }
 
@@ -80,23 +85,23 @@ impl VecMapBuilder {
 ///
 /// Immutable version of Mutable Vector Map.
 /// 
-pub struct VecMap<T> {
-    store: Vec<T>,
-    partitions: Vec<isize>,
+pub struct VecMap<'a, T> {
+    data: &'a [T],
+    partitions: Vec<usize>,
 }
 
-impl<T: Clone + Sized> VecMap<T> {
+impl<'a, T: Clone + Sized> VecMap<'a, T> {
+    #[inline]
     pub fn borrow(&self, idx: usize) -> &[T] {
 	let offset = self.partitions[idx];
 	let size = self.partitions[idx + 1] - offset;
 	let slice = unsafe {
-	    let ptr = self.store.as_ptr().offset(offset) as *mut T;
-	    std::slice::from_raw_parts(ptr, size as usize)
+	    let ptr = self.data.as_ptr().offset(offset as isize) as *mut T;
+	    std::slice::from_raw_parts(ptr, size)
 	};
 	slice
     }
 }
-
 
 /// Mutable Vector Mapping
 ///
@@ -110,16 +115,16 @@ impl<T: Clone + Sized> VecMap<T> {
 ///
 /// A common idiom in Rust is to use `Arc<RwLock<Vec<_>>>`
 /// when you need a thread-safe vector,
-/// which requires 72 bytes of memory (Arc: 8, Mutex: 40, Vec: 24)
+/// which requires 48 bytes of memory (Arc: 8, parking_lot::RwLock: 16, Vec: 24)
 /// in addition to the vector contents.
 ///
-/// For VecMap, RwLock : 40, isize: 8 for a total of 48Byte.
-pub struct MutVecMap<T> {
-    store: Vec<T>,
-    partitions: Vec<RwLock<isize>>,
+/// For VecMap, parking_lot::RwLock: 16, isize: 8 for a total of 34Byte.
+pub struct MutVecMap<'a, T> {
+    data: &'a [T],
+    partitions: Vec<RwLock<usize>>,
 }
 
-impl<T: Clone + Sized> MutVecMap<T> {
+impl<'a, T: Clone + Sized> MutVecMap<'a, T> {
     /// borrow returns immutable slice of chunk.
     /// Wrapperd by SliceReadGuard.
     ///
@@ -129,19 +134,18 @@ impl<T: Clone + Sized> MutVecMap<T> {
     /// use vecmap::VecMapBuilder;
     /// 
     /// let builder = VecMapBuilder::new();
-    /// builder.alloc(10);
-    /// builder.alloc(5);
-    /// let vecmap = builder.build_mut(0);
-    /// let s0 = vecmap.borrow(0);
-    /// assert_eq!(s0.len(), 10);
+    /// builder.insert(&[1, 2, 3]);
+    /// builder.insert(&[4, 5]);
+    /// let vecmap = builder.build_mut();
+    /// assert_eq!(3, vecmap.borrow(0).len());
     /// ```
     pub fn borrow(&self, idx: usize) -> SliceReadGuard<T> {
-	let guard = self.partitions[idx].read().unwrap();
+	let guard = self.partitions[idx].read();
 	let offset = *guard;
-	let size = *self.partitions[idx + 1].read().unwrap() - offset;
+	let size = *self.partitions[idx + 1].read() - offset;
 	let slice = unsafe {
-	    let ptr = self.store.as_ptr().offset(offset) as *mut T;
-	    std::slice::from_raw_parts(ptr, size as usize)
+	    let ptr = self.data.as_ptr().offset(offset as isize);
+	    std::slice::from_raw_parts(ptr, size)
 	};
 	SliceReadGuard { guard, slice }
     }
@@ -155,18 +159,18 @@ impl<T: Clone + Sized> MutVecMap<T> {
     /// use vecmap::VecMapBuilder;
     /// 
     /// let builder = VecMapBuilder::new();
-    /// builder.alloc(10);
-    /// builder.alloc(5);
-    /// let vecmap = builder.build_mut(0);
-    /// let mut s1 = vecmap.borrow_mut(1);
-    /// s1[1] = 9;
+    /// builder.insert(&[1, 2, 3]);
+    /// builder.insert(&[4, 5]);
+    /// let vecmap = builder.build_mut();
+    /// vecmap.borrow_mut(1)[1] = 9;
+    /// assert_eq!([4, 9], *vecmap.borrow(1));
     /// ```
     pub fn borrow_mut(&self, idx: usize) -> SliceWriteGuard<T> {
-	let guard = self.partitions[idx].write().unwrap();
+	let guard = self.partitions[idx].write();
 	let offset = *guard;
-	let size = *self.partitions[idx + 1].read().unwrap() - offset;
+	let size = *self.partitions[idx + 1].read() - offset;
 	let slice = unsafe {
-	    let ptr = self.store.as_ptr().offset(offset) as *mut T;
+	    let ptr = self.data.as_ptr().offset(offset as isize) as *mut T;
 	    std::slice::from_raw_parts_mut(ptr, size as usize)
 	};
 	SliceWriteGuard { guard, slice }
@@ -175,7 +179,7 @@ impl<T: Clone + Sized> MutVecMap<T> {
 
 #[derive(Debug)]
 pub struct SliceReadGuard<'a, T> {
-    guard: RwLockReadGuard<'a, isize>,
+    guard: RwLockReadGuard<'a, usize>,
     slice: &'a [T],
 }
 
@@ -195,7 +199,7 @@ impl<T> Drop for SliceReadGuard<'_, T> {
 
 #[derive(Debug)]
 pub struct SliceWriteGuard<'a, T> {
-    guard: RwLockWriteGuard<'a, isize>,
+    guard: RwLockWriteGuard<'a, usize>,
     slice: &'a mut [T],
 }
 
@@ -220,10 +224,10 @@ impl<T> Drop for SliceWriteGuard<'_, T> {
 }
 
 
-unsafe impl<T> Send for MutVecMap<T> {}
-unsafe impl<T> Sync for MutVecMap<T> {}
-unsafe impl<T> Send for VecMap<T> {}
-unsafe impl<T> Sync for VecMap<T> {}
+unsafe impl<'a, T> Send for MutVecMap<'a, T> {}
+unsafe impl<'a, T> Sync for MutVecMap<'a, T> {}
+unsafe impl<'a, T> Send for VecMap<'a, T> {}
+unsafe impl<'a, T> Sync for VecMap<'a, T> {}
 
 
 #[cfg(test)]
@@ -237,17 +241,14 @@ mod vac_store_tests {
     fn read_concurrent() {
 	let n = 1000;
 	let m = 100;
-	let vsbuilder = VecMapBuilder::new();
-	let allocs = (1..n).collect::<Vec<isize>>();
-	let allocated: Arc<Vec<usize>> = Arc::new(
-	    allocs.into_par_iter().map(|x| vsbuilder.alloc(x)).collect());
-
-	let vs = vsbuilder.build(1);
+	let builder = VecMapBuilder::new();
+	for x in 0..n { builder.insert(&vec![1; x]); };
+	let vm = builder.build();
 	
-	(0..m).collect::<Vec<isize>>().par_iter()
+	(0..m).collect::<Vec<_>>().par_iter()
 	    .for_each(|_| {
-		for &idx in allocated.iter() {
-		    let slice = vs.borrow(idx);
+		for idx in 0..n {
+		    let slice = vm.borrow(idx);
 		    assert!(slice.iter().all(|&x| x == 1));
 		}
 	    });
@@ -255,18 +256,15 @@ mod vac_store_tests {
 
     #[bench]
     fn bench_concurrent_read(b: &mut Bencher) {
-	let n = 10000;
+	let n = 1000;
 	let m = 10;
-	let vsbuilder = VecMapBuilder::new();
-	let allocs = (1..n).collect::<Vec<isize>>();
-	let allocated: Arc<Vec<usize>> = Arc::new(
-	    allocs.into_par_iter().map(|x| vsbuilder.alloc(x)).collect());
-
-	let vs = vsbuilder.build(1);
+	let builder = VecMapBuilder::new();
+	for x in 0..n { builder.insert(&vec![1; x]); };
+	let vm = builder.build();
 
 	let mut rng = rand::thread_rng();
 	let xss = (0..m).map(|_| {
-	    let mut xs = allocated.to_vec();
+	    let mut xs = (0..n).collect::<Vec<_>>();
 	    xs.shuffle(&mut rng);
 	    xs
 	}).collect::<Vec<_>>();
@@ -274,7 +272,7 @@ mod vac_store_tests {
         b.iter(|| {
 	    xss.par_iter().for_each(|xs| {
 		for &idx in xs.iter() {
-		    let slice = vs.borrow(idx);
+		    let slice = vm.borrow(idx);
 		    slice.iter().fold(0, |x, y| x + y);
 		}
 	    });
@@ -283,18 +281,15 @@ mod vac_store_tests {
 
     #[bench]
     fn bench_serialized_read(b: &mut Bencher) {
-	let n = 10000;
+	let n = 1000;
 	let m = 10;
-	let vsbuilder = VecMapBuilder::new();
-	let allocs = (1..n).collect::<Vec<isize>>();
-	let allocated: Arc<Vec<usize>> = Arc::new(
-	    allocs.into_par_iter().map(|x| vsbuilder.alloc(x)).collect());
-
-	let vs = vsbuilder.build(1);
+	let builder = VecMapBuilder::new();
+	for x in 0..n { builder.insert(&vec![1; x]); };
+	let vm = builder.build();
 
 	let mut rng = rand::thread_rng();
 	let xss = (0..m).map(|_| {
-	    let mut xs = allocated.to_vec();
+	    let mut xs = (0..n).collect::<Vec<_>>();
 	    xs.shuffle(&mut rng);
 	    xs
 	}).collect::<Vec<_>>();
@@ -302,14 +297,13 @@ mod vac_store_tests {
         b.iter(|| {
 	    xss.iter().for_each(|xs| {
 		for &idx in xs.iter() {
-		    let slice = vs.borrow(idx);
+		    let slice = vm.borrow(idx);
 		    slice.iter().fold(0, |x, y| x + y);
 		}
 	    });
 	});
     }
 }
-
 
 #[cfg(test)]
 mod mut_vac_store_tests {
@@ -321,79 +315,73 @@ mod mut_vac_store_tests {
     #[test]
     fn builder_allocates_concurrent() {
 	let n = 10000;
-	let vsbuilder = VecMapBuilder::new();
-	let allocs = (1..n).collect::<Vec<isize>>();
-	let sum_allocs = allocs.iter().sum::<isize>();
-	let num_allocs = allocs.len();
-	let mut allocated: Vec<usize> = allocs.into_par_iter()
-	    .map(|x| vsbuilder.alloc(x)).collect();
-	allocated.sort();
-
-	let vs = vsbuilder.build_mut(0.0);
-	assert_eq!(sum_allocs, vs.store.len() as isize);
-	assert_eq!(num_allocs, allocated.len());
+	let builder = VecMapBuilder::new();
+	let indices = (0..n).into_par_iter()
+	    .map(|x| builder.insert(&vec![1; x]));
+	assert_eq!((0..n).sum::<usize>(), indices.sum());
+	
+	let vm = builder.build_mut();
+	assert_eq!(n * (n - 1) / 2, vm.data.len());
+	assert_eq!(n + 1, vm.partitions.len());
     }
 
     #[test]
     fn update_concurrent() {
 	let n = 1000;
 	let m = 100;
-	let vsbuilder = VecMapBuilder::new();
-	let allocs = (1..n).collect::<Vec<isize>>();
-	let allocated: Arc<Vec<usize>> = Arc::new(
-	    allocs.into_par_iter().map(|x| vsbuilder.alloc(x)).collect());
+	let builder = VecMapBuilder::new();
+	let _indices = (0..n).into_par_iter()
+	    .for_each(|x| { builder.insert(&vec![1; x]); });
 
-	let vs = vsbuilder.build_mut(0);
-	
-	(0..m).collect::<Vec<isize>>().par_iter()
+	let vm = builder.build_mut();
+
+	(0..m).collect::<Vec<_>>().par_iter()
 	    .for_each(|_| {
-		for &idx in allocated.iter() {
-		    let mut slice = vs.borrow_mut(idx);
+		for idx in 0..n {
+		    let mut slice = vm.borrow_mut(idx);
 		    slice.iter_mut().for_each(|x| *x += 1);
 		}
 	    });
-	assert!(vs.store.iter().all(|&x| x == m));
+	// all values +1 in 'm' times.
+	assert!(vm.data.iter().all(|&x| x == m + 1));
     }
 
     #[test]
     fn read_concurrent() {
 	let n = 1000;
 	let m = 100;
-	let vsbuilder = VecMapBuilder::new();
-	let allocs = (1..n).collect::<Vec<isize>>();
-	let allocated: Arc<Vec<usize>> = Arc::new(
-	    allocs.into_par_iter().map(|x| vsbuilder.alloc(x)).collect());
+	let builder = VecMapBuilder::new();
+	let _indices = (0..n).into_par_iter()
+	    .for_each(|x| { builder.insert(&vec![1; x]); });
 
-	let vs = vsbuilder.build_mut(1);
-	
-	(0..m).collect::<Vec<isize>>().par_iter()
+	let vm = builder.build_mut();
+
+	(0..m).collect::<Vec<_>>().par_iter()
 	    .for_each(|_| {
-		for &idx in allocated.iter() {
-		    let slice = vs.borrow(idx);
+		for idx in 0..n {
+		    let slice = vm.borrow(idx);
 		    assert!(slice.iter().all(|&x| x == 1));
 		}
 	    });
     }
-    
+  
     #[bench]
-    fn bench_concurrent_alloc(b: &mut Bencher) {
+    fn bench_concurrent_insert(b: &mut Bencher) {
 	let n = 10000;
-	let vsbuilder = VecMapBuilder::new();
         b.iter(|| {
-	    let allocs = (1..n).collect::<Vec<isize>>();
-	    allocs.into_par_iter()
-		.for_each(|x| { vsbuilder.alloc(x); });
+	    let builder = VecMapBuilder::new();
+	    (0..n).collect::<Vec<_>>().into_par_iter()
+		.for_each(|x| { builder.insert(&vec![1; x]); });
 	});
     }    
 
     #[bench]
-    fn bench_serialized_alloc(b: &mut Bencher) {
+    fn bench_serialized_insert(b: &mut Bencher) {
 	let n = 10000;
-	let vsbuilder = VecMapBuilder::new();
         b.iter(|| {
-	    let allocs = (1..n).collect::<Vec<isize>>();
-	    allocs.into_iter()
-		.for_each(|x| { vsbuilder.alloc(x); });
+	    let builder = VecMapBuilder::new();
+	    (0..n).collect::<Vec<_>>().into_iter()
+		.for_each(|x| { builder.insert(&vec![1; x]); });
 	});
     }
     
@@ -401,16 +389,14 @@ mod mut_vac_store_tests {
     fn bench_concurrent_update(b: &mut Bencher) {
 	let n = 1000;
 	let m = 100;
-	let vsbuilder = VecMapBuilder::new();
-	let allocs = (1..n).collect::<Vec<isize>>();
-	let allocated: Arc<Vec<usize>> = Arc::new(
-	    allocs.into_par_iter().map(|x| vsbuilder.alloc(x)).collect());
+	let builder = VecMapBuilder::new();
+	for x in 0..n { builder.insert(&vec![1; x]); };
 
-	let vs = vsbuilder.build_mut(0);
+	let vm = builder.build_mut();
 
 	let mut rng = rand::thread_rng();
 	let xss = (0..m).map(|_| {
-	    let mut xs = allocated.to_vec();
+	    let mut xs = (0..n).collect::<Vec<_>>();
 	    xs.shuffle(&mut rng);
 	    xs
 	}).collect::<Vec<_>>();
@@ -418,7 +404,7 @@ mod mut_vac_store_tests {
         b.iter(|| {
 	    xss.par_iter().for_each(|xs| {
 		for &idx in xs.iter() {
-		    let mut slice = vs.borrow_mut(idx);
+		    let mut slice = vm.borrow_mut(idx);
 		    slice.iter_mut().for_each(|x| *x += 1);
 		}
 	    });
@@ -429,16 +415,14 @@ mod mut_vac_store_tests {
     fn bench_concurrent_read(b: &mut Bencher) {
 	let n = 1000;
 	let m = 100;
-	let vsbuilder = VecMapBuilder::new();
-	let allocs = (1..n).collect::<Vec<isize>>();
-	let allocated: Arc<Vec<usize>> = Arc::new(
-	    allocs.into_par_iter().map(|x| vsbuilder.alloc(x)).collect());
+	let builder = VecMapBuilder::new();
+	for x in 0..n { builder.insert(&vec![1; x]); };
 
-	let vs = vsbuilder.build_mut(1);
+	let vm = builder.build_mut();
 
 	let mut rng = rand::thread_rng();
 	let xss = (0..m).map(|_| {
-	    let mut xs = allocated.to_vec();
+	    let mut xs = (0..n).collect::<Vec<_>>();
 	    xs.shuffle(&mut rng);
 	    xs
 	}).collect::<Vec<_>>();
@@ -446,27 +430,25 @@ mod mut_vac_store_tests {
         b.iter(|| {
 	    xss.par_iter().for_each(|xs| {
 		for &idx in xs.iter() {
-		    let slice = vs.borrow(idx);
+		    let slice = vm.borrow(idx);
 		    slice.iter().fold(0, |x, y| x + y);
 		}
 	    });
 	});
     }
-    
+
     #[bench]
     fn bench_serialized_update(b: &mut Bencher) {
 	let n = 1000;
 	let m = 100;
-	let vsbuilder = VecMapBuilder::new();
-	let allocs = (1..n).collect::<Vec<isize>>();
-	let allocated: Arc<Vec<usize>> = Arc::new(
-	    allocs.into_par_iter().map(|x| vsbuilder.alloc(x)).collect());
+	let builder = VecMapBuilder::new();
+	for x in 0..n { builder.insert(&vec![1; x]); };
 
-	let vs = vsbuilder.build_mut(0);
+	let vm = builder.build_mut();
 
 	let mut rng = rand::thread_rng();
 	let xss = (0..m).map(|_| {
-	    let mut xs = allocated.to_vec();
+	    let mut xs = (0..n).collect::<Vec<_>>();
 	    xs.shuffle(&mut rng);
 	    xs
 	}).collect::<Vec<_>>();
@@ -474,7 +456,7 @@ mod mut_vac_store_tests {
         b.iter(|| {
 	    xss.iter().for_each(|xs| {
 		for &idx in xs.iter() {
-		    let mut slice = vs.borrow_mut(idx);
+		    let mut slice = vm.borrow_mut(idx);
 		    slice.iter_mut().for_each(|x| *x += 1);
 		}
 	    });
@@ -482,19 +464,18 @@ mod mut_vac_store_tests {
     }
 
     #[bench]
-    fn bench_fully_concurrent_update(b: &mut Bencher) {
+    fn bench_for_compare_fully_concurrent_update(b: &mut Bencher) {
 	let n = 1000;
 	let m = 100;
 	let mut store: Vec<Mutex<Vec<usize>>> = vec![];
 	for _ in 0..m {
-	    // create same length of vector (499500)
 	    store.push(Mutex::new(vec![0; n * (n - 1) / 2]));
 	}
 	
         b.iter(|| {
 	    (0..m).collect::<Vec<isize>>().par_iter()
 		.for_each(|&i| {
-		    let mut target = store[i as usize].lock().unwrap();
+		    let mut target = store[i as usize].lock();
 		    target.iter_mut().for_each(|x| *x += 1);
 		});
 	});
